@@ -1,0 +1,6 @@
+{
+  "name": "XLOOKUP & Variance Reconciler",
+  "description": "Perform advanced XLOOKUP and variance comparison between two CSV datasets with flexible matching rules, multi-match aggregation, and template storage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
