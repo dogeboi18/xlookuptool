@@ -116,6 +116,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const finalCsvString = csvRows.join('\n');
     const filename = `xlookup_reconciliation_${new Date().toISOString().slice(0, 10)}.csv`;
 
+    // Automatically save copy to repository reconciliations folder if available
+    try {
+      const fs = await import('fs');
+      const path = await import('path');
+      const repoDir = path.resolve(process.cwd(), 'reconciliations');
+      if (!fs.existsSync(repoDir)) {
+        fs.mkdirSync(repoDir, { recursive: true });
+      }
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const autoSaveName = `reconciliation_${timestamp}.csv`;
+      fs.writeFileSync(path.join(repoDir, autoSaveName), finalCsvString, 'utf-8');
+    } catch (saveErr) {
+      console.warn('Could not auto-save to reconciliations directory:', saveErr);
+    }
+
     // Return as a raw CSV file stream so Make.com can pass it straight to Google Drive
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);

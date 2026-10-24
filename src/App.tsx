@@ -1,10 +1,16 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { User } from 'firebase/auth';
 import { Header } from './components/Header';
 import { ConfigPanel } from './components/ConfigPanel';
 import { ResultsTable } from './components/ResultsTable';
 import { TemplateModal } from './components/TemplateModal';
+import { DrivePickerModal } from './components/DrivePickerModal';
+import { SaveToDriveModal } from './components/SaveToDriveModal';
+import { SavedRunsModal } from './components/SavedRunsModal';
 import { DEFAULT_FILE_1, DEFAULT_FILE_2, parseCSV, parseNumber, exportToCSVFilename } from './utils/csvParser';
 import { CsvDataset, ReconcileConfig, ReconcileResultItem, SavedTemplate } from './types';
+import { initAuth, googleSignIn, logout } from './utils/googleAuth';
+import { saveReconciliationToRepo, fetchSavedReconciliations } from './services/reconciliationStorage';
 
 export default function App() {
   const [file1Text, setFile1Text] = useState(DEFAULT_FILE_1);
@@ -24,9 +30,69 @@ export default function App() {
   const [templates, setTemplates] = useState<SavedTemplate[]>([]);
   const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
 
+  // Google Drive & Auth State
+  const [user, setUser] = useState<User | null>(null);
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [isDrivePickerOpen, setIsDrivePickerOpen] = useState(false);
+  const [drivePickerTarget, setDrivePickerTarget] = useState<'file1' | 'file2'>('file1');
+  const [isSaveToDriveOpen, setIsSaveToDriveOpen] = useState(false);
+
+  // Repository Reconciliations Folder State
+  const [isSavedRunsOpen, setIsSavedRunsOpen] = useState(false);
+  const [savedRunsCount, setSavedRunsCount] = useState(0);
+  const [lastAutoSavedFile, setLastAutoSavedFile] = useState<string | null>(null);
+  const [isAutoSaving, setIsAutoSaving] = useState(false);
+  const [refreshRunsTrigger, setRefreshRunsTrigger] = useState(0);
+
+  // Load initial count of saved runs in repository folder
+  useEffect(() => {
+    fetchSavedReconciliations().then((files) => {
+      setSavedRunsCount(files.length);
+    });
+  }, [refreshRunsTrigger]);
+
   // Parse datasets
   const file1Data = useMemo(() => parseCSV(file1Text), [file1Text]);
   const file2Data = useMemo(() => parseCSV(file2Text), [file2Text]);
+
+  // Auth initialization
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      (authUser, token) => {
+        setUser(authUser);
+        setAccessToken(token);
+      },
+      () => {
+        setUser(null);
+        setAccessToken(null);
+      }
+    );
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
+
+  const handleSignIn = async () => {
+    try {
+      const res = await googleSignIn();
+      if (res) {
+        setUser(res.user);
+        setAccessToken(res.accessToken);
+      }
+    } catch (err) {
+      console.error('Google Sign-in failed:', err);
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await logout();
+      setUser(null);
+      setAccessToken(null);
+    } catch (err) {
+      console.error('Sign-out failed:', err);
+    }
+  };
 
   // Load templates from localStorage on mount
   useEffect(() => {
@@ -40,9 +106,7 @@ export default function App() {
     }
   }, []);
 
-// =========================================================================
-  // ADD THIS BLOCK: Listen for URL Query Parameters & Window PostMessages
-  // =========================================================================
+  // Listen for URL Query Parameters & Window PostMessages
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
 
@@ -92,7 +156,7 @@ export default function App() {
         }
       }
     };
-//--------------------------------------------------------------------------------------------
+
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
   }, []);
@@ -102,10 +166,11 @@ export default function App() {
     if (file1Data.headers.length > 0 && file2Data.headers.length > 0) {
       runReconciliation();
     }
-  }, [file1Text, file2Text, config]);
+  }, [file1Data, file2Data, config]);
 
   const runReconciliation = () => {
-    if (!config.file1KeyCol || !config.file1ValCol || !config.file2KeyCol || !config.file2ValCol) {
+    if (!config.file1KeyCol || !config.file2KeyCol) {
+      setResults([]);
       return;
     }
 
@@ -134,7 +199,6 @@ export default function App() {
       const lookupKey = row[config.file1KeyCol] || '';
       const f1Val = parseNumber(row[config.file1ValCol]);
 
-      // Find matches in File 2
       const matchingFile2Rows = file2Data.rows.filter((f2Row) => {
         const f2Key = f2Row[config.file2KeyCol] || '';
         if (!lookupKey || !f2Key) return false;
@@ -145,7 +209,6 @@ export default function App() {
         if (config.matchType === 'exact') {
           return cleanKey1 === cleanKey2;
         } else {
-          // Substring / Contains match (File 2 contains File 1 key or vice versa)
           return cleanKey2.includes(cleanKey1) || cleanKey1.includes(cleanKey2);
         }
       });
@@ -162,28 +225,58 @@ export default function App() {
         } else if (config.multiMatchStrategy === 'first') {
           f2Val = parseNumber(matchingFile2Rows[0][config.file2ValCol]);
         } else if (config.multiMatchStrategy === 'last') {
-          f2Val = parseNumber(matchingFile2Rows[matchingFile2Rows.length - 1][config.file2ValCol]);
+          f2Val = parseNumber(
+            matchingFile2Rows[matchingFile2Rows.length - 1][config.file2ValCol]
+          );
         }
       }
 
       const difference = f1Val - f2Val;
-      const percentVariance = f2Val !== 0 ? (difference / Math.abs(f2Val)) * 100 : (f1Val !== 0 ? 100 : 0);
+      const percentVariance =
+        f2Val !== 0 ? (difference / Math.abs(f2Val)) * 100 : f1Val !== 0 ? 100 : 0;
 
       newResults.push({
-        id: `res-${idx}-${lookupKey}`,
+        id: `res-${idx}`,
         file1RowIndex: idx,
         lookupKey,
         file1Value: f1Val,
+        file2Value: f2Val,
         matched,
         matchedFile2RowsCount: matchingFile2Rows.length,
-        file2Value: f2Val,
         difference,
         percentVariance,
         file1OriginalRow: row,
+        file2MatchedSummary: matchingFile2Rows.map((r) => r[config.file2ValCol]).join(', '),
       });
     });
 
     setResults(newResults);
+    if (newResults.length > 0) {
+      autoSaveToRepository(newResults);
+    }
+  };
+
+  const autoSaveToRepository = async (items: ReconcileResultItem[], customFilename?: string) => {
+    if (items.length === 0) return;
+    const csvString = generateResultsCsvString(items);
+    setIsAutoSaving(true);
+    try {
+      const res = await saveReconciliationToRepo(csvString, customFilename, {
+        matchType: config.matchType,
+        multiMatchStrategy: config.multiMatchStrategy,
+        aggregateFile1: config.aggregateFile1,
+        totalRows: items.length,
+        matchedRows: items.filter((r) => r.matched).length,
+      });
+      if (res?.filename) {
+        setLastAutoSavedFile(res.filename);
+        setRefreshRunsTrigger((prev) => prev + 1);
+      }
+    } catch (err) {
+      console.warn('Auto-save to repository folder skipped or failed:', err);
+    } finally {
+      setIsAutoSaving(false);
+    }
   };
 
   const handleResetToDefaults = () => {
@@ -234,13 +327,11 @@ export default function App() {
     }
   };
 
-  const handleExportCSV = () => {
-    if (results.length === 0) return;
-
+  const generateResultsCsvString = (items: ReconcileResultItem[] = results) => {
     const headers = ['Status', 'Lookup Key', 'File 1 Value', 'File 2 Looked-Up Value', 'Matched Rows Count', 'Difference', 'Percent Variance'];
     const csvRows = [headers.join(',')];
 
-    results.forEach((r) => {
+    items.forEach((r) => {
       const rowData = [
         r.matched ? 'TRUE' : 'FALSE',
         `"${r.lookupKey.replace(/"/g, '""')}"`,
@@ -253,7 +344,35 @@ export default function App() {
       csvRows.push(rowData.join(','));
     });
 
-    exportToCSVFilename(`xlookup_reconciliation_${new Date().toISOString().slice(0, 10)}.csv`, csvRows.join('\n'));
+    return csvRows.join('\n');
+  };
+
+  const handleExportCSV = async () => {
+    if (results.length === 0) return;
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+    const filename = `xlookup_reconciliation_${timestamp}.csv`;
+    const csvString = generateResultsCsvString(results);
+    
+    // Download directly in browser
+    exportToCSVFilename(filename, csvString);
+
+    // Automatically save copy to repository /reconciliations folder
+    await autoSaveToRepository(results, filename);
+  };
+
+  const handleOpenDrivePicker = (target: 'file1' | 'file2') => {
+    setDrivePickerTarget(target);
+    setIsDrivePickerOpen(true);
+  };
+
+  const handleDriveFileSelected = (content: string, _filename: string) => {
+    if (drivePickerTarget === 'file1') {
+      setFile1Text(content);
+    } else {
+      setFile2Text(content);
+    }
   };
 
   return (
@@ -263,6 +382,11 @@ export default function App() {
         onExportCSV={handleExportCSV}
         onOpenTemplates={() => setIsTemplateModalOpen(true)}
         onResetToDefaults={handleResetToDefaults}
+        user={user}
+        onSignIn={handleSignIn}
+        onSignOut={handleSignOut}
+        onSaveToDrive={() => setIsSaveToDriveOpen(true)}
+        onOpenSavedRuns={() => setIsSavedRunsOpen(true)}
       />
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6">
@@ -277,7 +401,13 @@ export default function App() {
           setConfig={setConfig}
           onRunReconciliation={runReconciliation}
           onExportCSV={handleExportCSV}
+          onSaveToDrive={() => setIsSaveToDriveOpen(true)}
+          onOpenDrivePicker={handleOpenDrivePicker}
           hasResults={results.length > 0}
+          onOpenSavedRuns={() => setIsSavedRunsOpen(true)}
+          lastAutoSavedFile={lastAutoSavedFile}
+          isAutoSaving={isAutoSaving}
+          savedRunsCount={savedRunsCount}
         />
 
         <div className="mb-4 flex items-center justify-between border-t border-zinc-200 pt-8 mt-12">
@@ -297,6 +427,33 @@ export default function App() {
         onSaveTemplate={handleSaveTemplate}
         onLoadTemplate={handleLoadTemplate}
         onDeleteTemplate={handleDeleteTemplate}
+      />
+
+      {/* Google Drive File Picker */}
+      <DrivePickerModal
+        isOpen={isDrivePickerOpen}
+        onClose={() => setIsDrivePickerOpen(false)}
+        onSelectFile={handleDriveFileSelected}
+        targetLabel={drivePickerTarget === 'file1' ? 'Primary Data (File 1)' : 'Reference Ledger (File 2)'}
+        accessToken={accessToken}
+        onAuthSuccess={(token) => setAccessToken(token)}
+      />
+
+      {/* Google Drive Save Confirmation Dialog */}
+      <SaveToDriveModal
+        isOpen={isSaveToDriveOpen}
+        onClose={() => setIsSaveToDriveOpen(false)}
+        csvContent={generateResultsCsvString()}
+        rowCount={results.length}
+        accessToken={accessToken}
+        onAuthSuccess={(token) => setAccessToken(token)}
+      />
+
+      {/* Repository Reconciliations Folder Modal */}
+      <SavedRunsModal
+        isOpen={isSavedRunsOpen}
+        onClose={() => setIsSavedRunsOpen(false)}
+        onRefreshTrigger={refreshRunsTrigger}
       />
     </div>
   );
